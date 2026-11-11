@@ -67,4 +67,9 @@ export async function fetchHandler(request, env, runtime = globalThis) {
   return response.ok ? new Response(null, { status: 204 }) : new Response("Dispatch failed", { status: 502 });
 }
 
-export default { fetch: fetchHandler };
+export default {
+  fetch(request, env) {
+    // Cloudflare passes ExecutionContext as the third argument, not a fetch provider.
+    return fetchHandler(request, env);
+  },
+};

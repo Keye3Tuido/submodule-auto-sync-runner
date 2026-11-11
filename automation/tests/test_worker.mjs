@@ -1,11 +1,27 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { fetchHandler } from '../worker.js';
+import worker, { fetchHandler } from '../worker.js';
 
 const env = {
   GITEE_WEBHOOK_SECRET: 'secret', GITHUB_DISPATCH_TOKEN: 'token', GITHUB_DISPATCH_REPO: 'owner/repo',
   GITEE_SOURCES_JSON: JSON.stringify([{ repository: 'private/repo', branches: ['release/v1'] }])
 };
+
+test('Worker entry point keeps ExecutionContext separate from fetch dependencies', async () => {
+  const originalFetch = globalThis.fetch;
+  let dispatched = false;
+  globalThis.fetch = async () => { dispatched = true; return new Response(null, { status: 204 }); };
+  try {
+    const response = await worker.fetch(new Request('https://worker.example/hooks/gitee', {
+      method: 'POST', headers: { 'X-Gitee-Token': 'secret', 'X-Gitee-Event': 'Push Hook' },
+      body: JSON.stringify({ repository: { full_name: 'private/repo' }, ref: 'refs/heads/release/v1' }),
+    }), env, { waitUntil() {} });
+    assert.equal(response.status, 204);
+    assert.equal(dispatched, true);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
 
 test('rejects an unauthenticated webhook', async () => {
   const response = await fetchHandler(new Request('https://worker.example/hooks/gitee', { method: 'POST', body: '{}' }), env, { fetch: async () => { throw new Error('must not dispatch'); } });
