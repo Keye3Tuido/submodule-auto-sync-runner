@@ -1,6 +1,8 @@
 name: submodule-sync
 
 on:
+  schedule:
+    - cron: "2-57/5 * * * *"
   repository_dispatch:
     types: [gitee-submodule-push]
   workflow_dispatch:
