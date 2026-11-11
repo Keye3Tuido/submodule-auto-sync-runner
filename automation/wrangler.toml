@@ -3,5 +3,9 @@ main = "worker.js"
 compatibility_date = "2026-11-11"
 workers_dev = true
 
+[vars]
+GITHUB_DISPATCH_REPO = "Keye3Tuido/submodule-auto-sync-runner"
+GITEE_SOURCES_JSON = '[{"repository":"red_easyjoy/sand-loop-res","branches":["sandloop/GameResV1","sandloop/GameResV2"]},{"repository":"red_easyjoy/loop-sort-res-common","branches":["sandloop/GameResV1","sandloop/GameResV2"]},{"repository":"red_easyjoy/sand-loop-res-game","branches":["sandloop/GameResV1","sandloop/GameResV2"]}]'
+
 [observability]
 enabled = false

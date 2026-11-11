@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Deploy a free Gitee Push Webhook → Cloudflare Worker → GitHub Actions relay that validates events, triggers a fixed public execution repository, updates configured submodule gitlinks, and opens or updates a human-reviewed PR.
+**Goal:** Deploy a free Gitee Push Webhook → Hookdeck → Cloudflare Worker → GitHub Actions relay that validates events, triggers a fixed public execution repository, updates configured submodule gitlinks, and opens or updates a human-reviewed PR.
 
-**Architecture:** Gitee Webhooks send only authenticated push notifications to a Cloudflare Worker. The Worker filters and forwards a fixed `repository_dispatch` event to GitHub. GitHub Actions reads the trusted main repository `.gitmodules`, fetches configured submodule branches, updates only gitlinks, pushes a stable robot branch, and creates or updates one PR.
+**Architecture:** Gitee Webhooks send authenticated push notifications to Hookdeck. Hookdeck forwards the request with a separate relay credential to a Cloudflare Worker. The Worker validates both credentials, filters and forwards a fixed `repository_dispatch` event to GitHub. GitHub Actions reads the trusted main repository `.gitmodules`, fetches configured submodule branches, updates only gitlinks, pushes a stable robot branch, and creates or updates one PR.
 
-**Tech Stack:** Cloudflare Workers, Wrangler, GitHub Actions, Git, Python standard library, Node.js built-in test runner.
+**Tech Stack:** Hookdeck, Cloudflare Workers, Wrangler, GitHub Actions, Git, Python standard library, Node.js built-in test runner.
 
 **Spec:** `references/platforms.md` and the existing `SKILL.md` in this repository.
 
@@ -14,7 +14,7 @@
 
 - Only `.gitmodules` entries with an explicit non-empty `branch` are automatically updated.
 - Worker forwards a fixed event type and never trusts event data as a destination.
-- Secrets are stored in Cloudflare Worker Secrets or GitHub Actions Secrets and never in URLs, files, or logs.
+- Gitee and Hookdeck relay secrets are stored in their respective protected configuration and Cloudflare Worker Secrets; GitHub credentials remain in GitHub Actions or Worker Secrets and never in URLs, files, or logs.
 - The main repository target branch receives changes through a human-reviewed PR.
 - The public execution repository must not expose private repository URLs, SHA values, event bodies, or credentials in logs or artifacts.
 - The workflow retains a manual dispatch path for recovery.
@@ -110,7 +110,7 @@ Expected: PASS.
 
 - [ ] **Step 1: Verify credentials at input time without printing values**
 - [ ] **Step 2: Deploy Worker and set Worker Secrets**
-- [ ] **Step 3: Configure Gitee Push Webhooks for the listed source repositories and branches**
+- [ ] **Step 3: Configure Hookdeck and Gitee Push Webhooks for the listed source repositories and branches**
 - [ ] **Step 4: Set GitHub Actions Secrets and enable the workflow**
 - [ ] **Step 5: Run a test push and verify Worker response, Actions run, robot branch, and PR**
 - [ ] **Step 6: Verify duplicate, unrelated-branch, unauthorized, and no-op cases**

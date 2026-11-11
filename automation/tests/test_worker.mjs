@@ -6,6 +6,7 @@ const env = {
   GITEE_WEBHOOK_SECRET: 'secret', GITHUB_DISPATCH_TOKEN: 'token', GITHUB_DISPATCH_REPO: 'owner/repo',
   GITEE_SOURCES_JSON: JSON.stringify([{ repository: 'private/repo', branches: ['release/v1'] }])
 };
+const relayEnv = { ...env, RELAY_WEBHOOK_SECRET: 'relay-secret' };
 
 test('Worker entry point keeps ExecutionContext separate from fetch dependencies', async () => {
   const originalFetch = globalThis.fetch;
@@ -25,6 +26,23 @@ test('Worker entry point keeps ExecutionContext separate from fetch dependencies
 
 test('rejects an unauthenticated webhook', async () => {
   const response = await fetchHandler(new Request('https://worker.example/hooks/gitee', { method: 'POST', body: '{}' }), env, { fetch: async () => { throw new Error('must not dispatch'); } });
+  assert.equal(response.status, 401);
+});
+
+test('accepts the relay secret without exposing the Gitee webhook secret', async () => {
+  let dispatched = false;
+  const response = await fetchHandler(new Request('https://worker.example/hooks/gitee', {
+    method: 'POST', headers: { 'X-Relay-Token': 'relay-secret', 'X-Gitee-Token': 'secret', 'X-Gitee-Event': 'Push Hook' },
+    body: JSON.stringify({ repository: { full_name: 'private/repo' }, ref: 'refs/heads/release/v1' }),
+  }), relayEnv, { fetch: async () => { dispatched = true; return new Response(null, { status: 204 }); } });
+  assert.equal(response.status, 204);
+  assert.equal(dispatched, true);
+});
+
+test('rejects a relay request without the original Gitee token', async () => {
+  const response = await fetchHandler(new Request('https://worker.example/hooks/gitee', {
+    method: 'POST', headers: { 'X-Relay-Token': 'relay-secret', 'X-Gitee-Event': 'Push Hook' }, body: '{}'
+  }), relayEnv, { fetch: async () => { throw new Error('must not dispatch'); } });
   assert.equal(response.status, 401);
 });
 

@@ -15,8 +15,11 @@ export async function fetchHandler(request, env, runtime = globalThis) {
   if (request.method !== "POST" || url.pathname !== "/hooks/gitee") return new Response("Not found", { status: 404 });
 
   if (!env.GITEE_WEBHOOK_SECRET || !env.GITHUB_DISPATCH_TOKEN || !env.GITHUB_DISPATCH_REPO || !env.GITEE_SOURCES_JSON) return new Response("Service unavailable", { status: 503 });
-  const supplied = request.headers.get("X-Gitee-Token") || "";
-  if (!bytesEqual(supplied, env.GITEE_WEBHOOK_SECRET)) return new Response("Unauthorized", { status: 401 });
+  const relayToken = request.headers.get("X-Relay-Token") || "";
+  const giteeToken = request.headers.get("X-Gitee-Token") || "";
+  const authorizedByGitee = Boolean(env.GITEE_WEBHOOK_SECRET && giteeToken && bytesEqual(giteeToken, env.GITEE_WEBHOOK_SECRET));
+  const authorizedByRelay = Boolean(env.RELAY_WEBHOOK_SECRET && relayToken && bytesEqual(relayToken, env.RELAY_WEBHOOK_SECRET) && authorizedByGitee);
+  if (!authorizedByRelay && !authorizedByGitee) return new Response("Unauthorized", { status: 401 });
   if ((request.headers.get("X-Gitee-Event") || "").toLowerCase() !== "push hook") return new Response(null, { status: 204 });
 
   let payload;
