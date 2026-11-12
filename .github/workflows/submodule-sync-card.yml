@@ -1,0 +1,35 @@
+name: submodule-sync-card
+
+on:
+  repository_dispatch:
+    types: [gitee-submodule-push]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Verify configuration and planned updates without writing
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: submodule-sync-card
+  cancel-in-progress: false
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Run reconciliation
+        env:
+          SYNC_CONFIG: ${{ secrets.SYNC_CONFIG_CARD }}
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          SYNC_SIGNING_KEY: ${{ secrets.SYNC_SIGNING_KEY }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && 'true' || 'false' }}
+        run: |
+          python3 -m automation.run_sync
