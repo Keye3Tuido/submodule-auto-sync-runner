@@ -248,10 +248,34 @@ def main():
     print('Reconciliation completed. Changed gitlinks: ' + str(count))
 
 
+def failure_summary(error):
+    """Expose fixed diagnostic fields without logging private command arguments."""
+    detail = type(error).__name__
+    if isinstance(error, subprocess.CalledProcessError):
+        commands = {'init', 'fetch', 'ls-remote', 'show', 'ls-tree', 'rev-parse',
+                    'rev-list', 'diff', 'read-tree', 'update-index', 'write-tree',
+                    'commit-tree', 'push'}
+        args = error.cmd if isinstance(error.cmd, (list, tuple)) else []
+        operation = next((arg for arg in args if arg in commands), 'unknown')
+        stderr = error.stderr or ''
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode('utf-8', errors='replace')
+        stderr = stderr.lower()
+        category = 'other'
+        if any(value in stderr for value in ('authentication failed', 'could not read username', 'returned error: 401', 'returned error: 403')):
+            category = 'authentication'
+        elif any(value in stderr for value in ('returned error: 500', 'returned error: 502', 'returned error: 503', 'returned error: 504', 'bad gateway', 'service unavailable')):
+            category = 'server'
+        elif any(value in stderr for value in ('could not resolve host', 'failed to connect', 'connection timed out', 'connection reset', 'ssl_error', 'gnutls', 'rpc failed', 'early eof')):
+            category = 'network'
+        detail += f'; operation={operation}; exit={error.returncode}; category={category}'
+    return f'Reconciliation failed ({detail}). Inspect private repository state before retrying.'
+
+
 if __name__ == '__main__':
     try:
         main()
     except Exception as error:
         # Repository addresses, commit IDs and HTTP bodies stay out of public logs.
-        print('Reconciliation failed (' + type(error).__name__ + '). Inspect private repository state before retrying.', file=sys.stderr)
+        print(failure_summary(error), file=sys.stderr)
         sys.exit(1)
