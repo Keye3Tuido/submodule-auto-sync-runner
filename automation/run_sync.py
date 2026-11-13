@@ -6,10 +6,12 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
+from contextlib import contextmanager
 
 from automation.git_sync import Git, signed_commit, update_tree, verify_robot
 from automation.reconcile import build_update_plan, parse_gitmodules
@@ -17,6 +19,40 @@ from automation.reconcile import build_update_plan, parse_gitmodules
 SHA = re.compile(r'^[0-9a-f]{40}$')
 REPO = re.compile(r'^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$')
 PR_MARKER = '<!-- submodule-auto-sync -->'
+STAGES = {'configuration', 'runtime_secrets', 'repository_init', 'target_fetch',
+          'configuration_read', 'source_config', 'source_head', 'source_ancestry',
+          'update_plan', 'robot_head', 'robot_fetch', 'robot_verify',
+          'write_precondition', 'update_tree', 'commit_create', 'commit_verify',
+          'robot_push', 'push_verify', 'pr_sync'}
+
+
+@contextmanager
+def sync_stage(name, source_index=None):
+    """Log fixed stage identifiers; map source ordinals using the private config."""
+    if name not in STAGES or (source_index is not None and (type(source_index) is not int or source_index < 1)):
+        raise ValueError('invalid diagnostic stage')
+    source = '' if source_index is None else f' source_index={source_index}'
+    started = time.monotonic()
+    print(f'Sync stage={name} status=started{source}', flush=True)
+    try:
+        yield
+    except Exception as error:
+        elapsed = round(time.monotonic() - started, 3)
+        error.sync_stage = name
+        error.sync_source_index = source_index
+        error.sync_elapsed_seconds = elapsed
+        print(f'Sync stage={name} status=failed{source} elapsed_seconds={elapsed}', flush=True)
+        raise
+    else:
+        elapsed = round(time.monotonic() - started, 3)
+        print(f'Sync stage={name} status=completed{source} elapsed_seconds={elapsed}', flush=True)
+
+
+class GiteeRequestError(RuntimeError):
+    def __init__(self, method, status=None):
+        super().__init__('Gitee request did not complete; inspect remote state before retrying')
+        self.method = method if method in {'GET', 'POST', 'PATCH'} else 'UNKNOWN'
+        self.status = status
 
 
 def load_config():
@@ -85,9 +121,9 @@ class Gitee:
                 body = response.read()
                 return json.loads(body) if body else None
         except urllib.error.HTTPError as error:
-            raise RuntimeError('Gitee request failed (HTTP ' + str(error.code) + ')') from None
+            raise GiteeRequestError(method, error.code) from None
         except (urllib.error.URLError, TimeoutError):
-            raise RuntimeError('Gitee request did not complete; inspect remote state before retrying') from None
+            raise GiteeRequestError(method) from None
 
     def parents(self, repository, sha):
         if not SHA.fullmatch(sha):
@@ -182,68 +218,91 @@ def reconcile(config, token, signing_key, dry_run=False):
         repo = Path(directory) / 'main.git'
         repo.mkdir()
         git = Git(repo, env)
-        git.run('init', '--bare')
+        with sync_stage('repository_init'):
+            git.run('init', '--bare')
         main_url = 'https://gitee.com/' + config['main_owner'] + '/' + config['main_repo'] + '.git'
-        git.run('fetch', '--no-tags', main_url, 'refs/heads/' + config['target_branch'] + ':refs/heads/base')
-        target = git.run('rev-parse', 'refs/heads/base')
-        text = git.run('show', target + ':.gitmodules')
-        configured = {entry['path']: entry for entry in parse_gitmodules(text) if entry['branch']}
-        old = {}
-        for line in git.run('ls-tree', '-r', '-z', target).split('\0'):
-            if not line:
-                continue
-            mode, path = line.split('\t', 1)
-            if mode.startswith('160000 commit '):
-                old[path] = mode.split()[2]
+        with sync_stage('target_fetch'):
+            git.run('fetch', '--no-tags', main_url, 'refs/heads/' + config['target_branch'] + ':refs/heads/base')
+        with sync_stage('configuration_read'):
+            target = git.run('rev-parse', 'refs/heads/base')
+            text = git.run('show', target + ':.gitmodules')
+            configured = {entry['path']: entry for entry in parse_gitmodules(text) if entry['branch']}
+            old = {}
+            for line in git.run('ls-tree', '-r', '-z', target).split('\0'):
+                if not line:
+                    continue
+                mode, path = line.split('\t', 1)
+                if mode.startswith('160000 commit '):
+                    old[path] = mode.split()[2]
         new, branches = {}, {}
-        for path in config['allowed_paths']:
-            if path not in configured or path not in old:
-                raise RuntimeError('configured path lacks an explicit branch or existing gitlink')
-            entry = configured[path].copy()
-            entry['branch'] = config['target_branch'] if entry['branch'] == '.' else entry['branch']
-            repository = source_repository(entry['url'])
-            if repository not in config['sources']:
-                raise RuntimeError('source repository is outside the allowlist')
-            sha = remote_head(git, entry['url'], entry['branch'])
-            if not sha or not is_forward(old[path], sha, lambda value: api.parents(repository, value)):
-                raise RuntimeError('source branch is missing or is not a verified fast-forward')
+        for index, path in enumerate(config['allowed_paths'], 1):
+            with sync_stage('source_config', index):
+                if path not in configured or path not in old:
+                    raise RuntimeError('configured path lacks an explicit branch or existing gitlink')
+                entry = configured[path].copy()
+                entry['branch'] = config['target_branch'] if entry['branch'] == '.' else entry['branch']
+                repository = source_repository(entry['url'])
+                if repository not in config['sources']:
+                    raise RuntimeError('source repository is outside the allowlist')
+            with sync_stage('source_head', index):
+                sha = remote_head(git, entry['url'], entry['branch'])
+                if not sha:
+                    raise RuntimeError('source branch is missing')
+            with sync_stage('source_ancestry', index):
+                if not is_forward(old[path], sha, lambda value: api.parents(repository, value)):
+                    raise RuntimeError('source branch is not a verified fast-forward')
             new[path], branches[path] = sha, entry['branch']
-        plan = plan_from_gitmodules(text, old, new, config)
-        for item in plan:
-            item['branch'] = branches[item['path']]
-        bot = remote_head(git, main_url, config['robot_branch'])
+        with sync_stage('update_plan'):
+            plan = plan_from_gitmodules(text, old, new, config)
+            for item in plan:
+                item['branch'] = branches[item['path']]
+        with sync_stage('robot_head'):
+            bot = remote_head(git, main_url, config['robot_branch'])
         if bot:
-            git.run('fetch', '--no-tags', main_url, 'refs/heads/' + config['robot_branch'] + ':refs/heads/robot')
-            if git.run('rev-parse', 'refs/heads/robot') != bot:
-                raise RuntimeError('robot branch changed during fetch; retry reconciliation')
-            verify_robot(git, target, bot, config['allowed_paths'], signing_key)
+            with sync_stage('robot_fetch'):
+                git.run('fetch', '--no-tags', main_url, 'refs/heads/' + config['robot_branch'] + ':refs/heads/robot')
+                if git.run('rev-parse', 'refs/heads/robot') != bot:
+                    raise RuntimeError('robot branch changed during fetch; retry reconciliation')
+            with sync_stage('robot_verify'):
+                verify_robot(git, target, bot, config['allowed_paths'], signing_key)
         if dry_run:
             return len(plan)
-        if remote_head(git, main_url, config['target_branch']) != target:
-            raise RuntimeError('target branch changed; retry reconciliation')
+        with sync_stage('write_precondition'):
+            if remote_head(git, main_url, config['target_branch']) != target:
+                raise RuntimeError('target branch changed; retry reconciliation')
         if not plan:
-            api.ensure_pr(config, [])
+            with sync_stage('pr_sync'):
+                api.ensure_pr(config, [])
             return 0
-        tree = update_tree(git, target, plan)
-        if bot and git.run('rev-parse', bot + '^{tree}') == tree:
+        with sync_stage('update_tree'):
+            tree = update_tree(git, target, plan)
+            reuse_bot = bot and git.run('rev-parse', bot + '^{tree}') == tree
+        if reuse_bot:
             head = bot
         else:
             parents = [target] if not bot else [bot, target]
-            head = signed_commit(git, tree, parents, signing_key)
+            with sync_stage('commit_create'):
+                head = signed_commit(git, tree, parents, signing_key)
             # Expect an exact old SHA (or absence) and verify our signature before pushing.
-            verify_robot(git, target, head, config['allowed_paths'], signing_key)
-            git.run('push', '--force-with-lease=refs/heads/' + config['robot_branch'] + ':' + (bot or ''), main_url, head + ':refs/heads/' + config['robot_branch'])
-        if remote_head(git, main_url, config['robot_branch']) != head:
-            raise RuntimeError('pushed branch could not be verified')
-        api.ensure_pr(config, plan)
+            with sync_stage('commit_verify'):
+                verify_robot(git, target, head, config['allowed_paths'], signing_key)
+            with sync_stage('robot_push'):
+                git.run('push', '--force-with-lease=refs/heads/' + config['robot_branch'] + ':' + (bot or ''), main_url, head + ':refs/heads/' + config['robot_branch'])
+        with sync_stage('push_verify'):
+            if remote_head(git, main_url, config['robot_branch']) != head:
+                raise RuntimeError('pushed branch could not be verified')
+        with sync_stage('pr_sync'):
+            api.ensure_pr(config, plan)
         return len(plan)
 
 
 def main():
-    config = load_config()
-    token, key = os.environ.get('GITEE_TOKEN'), os.environ.get('SYNC_SIGNING_KEY')
-    if not token or not key:
-        raise RuntimeError('runtime secrets are incomplete')
+    with sync_stage('configuration'):
+        config = load_config()
+    with sync_stage('runtime_secrets'):
+        token, key = os.environ.get('GITEE_TOKEN'), os.environ.get('SYNC_SIGNING_KEY')
+        if not token or not key:
+            raise RuntimeError('runtime secrets are incomplete')
     count = reconcile(config, token, key, os.environ.get('DRY_RUN') == 'true')
     print('Reconciliation completed. Changed gitlinks: ' + str(count))
 
@@ -251,8 +310,12 @@ def main():
 def failure_summary(error):
     """Expose fixed diagnostic fields without logging private command arguments."""
     detail = type(error).__name__
-    if isinstance(error, subprocess.CalledProcessError):
-        commands = {'init', 'fetch', 'ls-remote', 'show', 'ls-tree', 'rev-parse',
+    if getattr(error, 'sync_stage', None) in STAGES:
+        detail += f'; stage={error.sync_stage}; elapsed_seconds={error.sync_elapsed_seconds}'
+        if error.sync_source_index is not None:
+            detail += f'; source_index={error.sync_source_index}'
+    if isinstance(error, (subprocess.CalledProcessError, subprocess.TimeoutExpired)):
+        commands = {'init', 'fetch', 'ls-remote', 'show', 'ls-tree', 'rev-parse', 'check-ref-format',
                     'rev-list', 'diff', 'read-tree', 'update-index', 'write-tree',
                     'commit-tree', 'push'}
         args = error.cmd if isinstance(error.cmd, (list, tuple)) else []
@@ -262,13 +325,24 @@ def failure_summary(error):
             stderr = stderr.decode('utf-8', errors='replace')
         stderr = stderr.lower()
         category = 'other'
-        if any(value in stderr for value in ('authentication failed', 'could not read username', 'returned error: 401', 'returned error: 403')):
+        if isinstance(error, subprocess.TimeoutExpired):
+            category = 'timeout'
+        elif any(value in stderr for value in ('authentication failed', 'could not read username', 'returned error: 401', 'returned error: 403')):
             category = 'authentication'
         elif any(value in stderr for value in ('returned error: 500', 'returned error: 502', 'returned error: 503', 'returned error: 504', 'bad gateway', 'service unavailable')):
             category = 'server'
         elif any(value in stderr for value in ('could not resolve host', 'failed to connect', 'connection timed out', 'connection reset', 'ssl_error', 'gnutls', 'rpc failed', 'early eof')):
             category = 'network'
-        detail += f'; operation={operation}; exit={error.returncode}; category={category}'
+        detail += f'; operation={operation}; category={category}'
+        if isinstance(error, subprocess.TimeoutExpired):
+            detail += f'; timeout_seconds={error.timeout}'
+        else:
+            detail += f'; exit={error.returncode}'
+    elif isinstance(error, GiteeRequestError):
+        category = 'network' if error.status is None else 'authentication' if error.status in (401, 403) else 'server' if error.status >= 500 else 'http'
+        detail += f'; operation=api_{error.method.lower()}; category={category}'
+        if error.status is not None:
+            detail += f'; http_status={error.status}'
     return f'Reconciliation failed ({detail}). Inspect private repository state before retrying.'
 
 
